@@ -1,0 +1,29 @@
+# ビルド出力
+bin/
+obj/
+x64/
+Debug/
+Release/
+*.exe
+*.pdb
+*.ilk
+*.obj
+*.iobj
+*.ipdb
+*.res
+*.tlog
+*.log
+*.lastbuildstate
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+*.aps
+ipch/
+
+# パッケージ
+dist/
+*.zip

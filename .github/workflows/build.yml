@@ -1,0 +1,55 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Select platform toolset
+        id: toolset
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $ver = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion
+          $major = [int]($ver.Split('.')[0])
+          $ts = if ($major -ge 18) { 'v145' } else { 'v143' }
+          "toolset=$ts" >> $env:GITHUB_OUTPUT
+          Write-Host "Visual Studio $ver -> $ts"
+
+      - name: Build
+        run: msbuild WinZoom.vcxproj /m /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=${{ steps.toolset.outputs.toolset }}
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/WinZoom | Out-Null
+          Copy-Item bin/x64/Release/WinZoom.exe dist/WinZoom/
+          Copy-Item README.md, LICENSE, CHANGELOG.md dist/WinZoom/
+          $name = if ($env:GITHUB_REF_TYPE -eq 'tag') { "WinZoom-$env:GITHUB_REF_NAME-x64.zip" } else { "WinZoom-x64.zip" }
+          Compress-Archive -Path dist/WinZoom -DestinationPath "dist/$name" -Force
+          "ZIP_NAME=$name" >> $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WinZoom-x64
+          path: dist/WinZoom/
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ env.ZIP_NAME }}
+          generate_release_notes: true
