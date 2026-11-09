@@ -53,7 +53,7 @@ namespace {
 constexpr wchar_t kMainClass[]    = L"WinZoom.Main";
 constexpr wchar_t kOverlayClass[] = L"WinZoom.Overlay";
 constexpr wchar_t kCursorClass[]  = L"WinZoom.Cursor";
-constexpr wchar_t kVersion[]      = L"1.0.0";
+constexpr wchar_t kVersion[]      = L"1.1.0";
 
 constexpr UINT WM_TRAYICON      = WM_APP + 1;
 constexpr UINT WM_APP_REFRESH   = WM_APP + 2;
@@ -136,6 +136,11 @@ struct App {
     bool reinjectUpSeen = false;
 
     bool posAdjusted = false;
+
+    // 擬似最大化(最大化ウインドウを拡大するモード)
+    bool pseudoMax = false;
+    WINDOWPLACEMENT savedPlacement{};
+    HMONITOR pmMonitor = nullptr;
     POINT origWinPos{}, adjWinPos{};
 
     // --- 描画カーソル ---
@@ -946,6 +951,7 @@ void Refresh() {
     g.refreshPosted = false;
     if (!g.active) return;
     if (!IsWindow(g.target)) { StopSession(false); return; }
+    if (g.pseudoMax && IsZoomed(g.target)) { StopSession(true); return; }   // 自分で最大化された
 
     const bool sus = !IsWindowVisible(g.target) || IsIconic(g.target) || IsZoomed(g.target) || IsCloaked(g.target);
     if (sus) {
@@ -977,6 +983,27 @@ void Refresh() {
     }
 }
 
+// 擬似最大化: 「作業領域 ÷ 倍率」のサイズにして左上に置く。拡大するとちょうど作業領域を埋める
+void PseudoMaxResize() {
+    if (!g.pseudoMax || !IsWindow(g.target) || IsIconic(g.target) || IsHungAppWindow(g.target)) return;
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (!g.pmMonitor || !GetMonitorInfoW(g.pmMonitor, &mi)) {
+        g.pmMonitor = MonitorFromWindow(g.target, MONITOR_DEFAULTTONEAREST);
+        GetMonitorInfoW(g.pmMonitor, &mi);
+    }
+    const RECT wa = mi.rcWork;
+    const LONG fw = static_cast<LONG>(std::floor(RW(wa) / g.scale));
+    const LONG fh = static_cast<LONG>(std::floor(RH(wa) / g.scale));
+    RECT win;
+    GetWindowRect(g.target, &win);
+    const RECT fr = FrameRect(g.target);
+    const LONG il = fr.left - win.left, it = fr.top - win.top;
+    const LONG ir = win.right - fr.right, ib = win.bottom - fr.bottom;
+    SetWindowPos(g.target, nullptr, wa.left - il, wa.top - it, fw + il + ir, fh + it + ib,
+                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+}
+
 // 拡大後の画面がモニタの作業領域に収まるように倍率と位置を調整
 void FitTarget(bool notify) {
     const RECT f = FrameRect(g.target);
@@ -1005,7 +1032,7 @@ void FitTarget(bool notify) {
     if (ny + sh > wa.bottom) ny = wa.bottom - sh;
     if (ny < wa.top) ny = wa.top;
     if ((nx != f.left || ny != f.top) && !IsHungAppWindow(g.target)) {
-        if (!g.posAdjusted) {
+        if (!g.posAdjusted && !g.pseudoMax) {
             g.posAdjusted = true;
             g.origWinPos = { w.left, w.top };
         }
@@ -1048,11 +1075,6 @@ bool StartSession(HWND h) {
         Balloon(L"拡大できるウインドウが見つかりませんでした。");
         return false;
     }
-    if (IsZoomed(h)) {
-        Balloon(L"最大化中のウインドウは拡大できません。元のサイズに戻してから実行してください。");
-        return false;
-    }
-
     g.active = true;
     g.target = h;
     g.tid = GetWindowThreadProcessId(h, &g.pid);
@@ -1069,21 +1091,43 @@ bool StartSession(HWND h) {
     g.layoutSig.clear();
     ClearTracked();
 
-    FitTarget(false);
-    if (g.scale < 1.1) {
-        g.active = false;
-        g.target = nullptr;
-        Balloon(L"このウインドウは画面に対して大きすぎるため拡大できません。");
-        return false;
+    // 最大化中なら擬似最大化モード: 元の配置(最大化状態と通常時の位置・サイズ)を保存して解除し、
+    // 「作業領域 ÷ 倍率」のサイズにする。解除時に保存した配置へ戻す。
+    g.pseudoMax = false;
+    if (IsZoomed(h)) {
+        g.savedPlacement = {};
+        g.savedPlacement.length = sizeof(WINDOWPLACEMENT);
+        if (IsHungAppWindow(h) || !GetWindowPlacement(h, &g.savedPlacement)) {
+            g.active = false;
+            g.target = nullptr;
+            Balloon(L"最大化ウインドウの状態を取得できませんでした。");
+            return false;
+        }
+        g.pseudoMax = true;
+        g.pmMonitor = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+        WINDOWPLACEMENT np = g.savedPlacement;
+        np.showCmd = SW_SHOWNORMAL;
+        np.flags = 0;
+        SetWindowPlacement(h, &np);
+        PseudoMaxResize();
     }
 
-    g.mouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, g.inst, 0);
-    if (!g.mouseHook) {
+    auto abortStart = [&](const wchar_t* msg) {
+        if (g.pseudoMax && IsWindow(h)) SetWindowPlacement(h, &g.savedPlacement);
+        g.pseudoMax = false;
         g.active = false;
         g.target = nullptr;
-        Balloon(L"マウスフックの設定に失敗しました。");
+        Balloon(msg);
         return false;
-    }
+    };
+
+    FitTarget(false);
+    if (g.scale < 1.1)
+        return abortStart(L"このウインドウは画面に対して大きすぎるため拡大できません。");
+
+    g.mouseHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, g.inst, 0);
+    if (!g.mouseHook)
+        return abortStart(L"マウスフックの設定に失敗しました。");
     AddSessionHooks();
     SetTimer(g.main, TIMER_SYNC, 100, nullptr);
     Refresh();
@@ -1100,6 +1144,7 @@ bool StartSession(HWND h) {
 void StopSession(bool restorePos) {
     if (!g.active) return;
     const bool wasMapped = g.mapped;
+    const double lastVx = MapX(g.rfx), lastVy = MapY(g.rfy);
     if (g.mapped) {
         // 解除後は「同じ UI 部品の上」にカーソルが残るよう、実カーソル位置のまま表示に戻す
         g.mapped = false;
@@ -1119,7 +1164,23 @@ void StopSession(bool restorePos) {
         g.overlayVisible = false;
     }
 
-    if (restorePos && g.posAdjusted && IsWindow(g.target) && !IsZoomed(g.target) && !IsIconic(g.target)) {
+    if (g.pseudoMax) {
+        // 擬似最大化: 通常時の位置・サイズを書き戻してから最大化する(1 回の SetWindowPlacement で両方)
+        if (restorePos && IsWindow(g.target)) {
+            WINDOWPLACEMENT wp = g.savedPlacement;
+            if (IsIconic(g.target)) {
+                wp.showCmd = SW_SHOWMINIMIZED;
+                wp.flags |= WPF_RESTORETOMAXIMIZED;
+            }
+            SetWindowPlacement(g.target, &wp);
+            // 最大化後は中身が再配置されるので、見えていた位置にカーソルを置く
+            if (wasMapped) {
+                double vx = lastVx, vy = lastVy;
+                ClampToDesktop(vx, vy);
+                SetCursorPos(static_cast<int>(std::lround(vx)), static_cast<int>(std::lround(vy)));
+            }
+        }
+    } else if (restorePos && g.posAdjusted && IsWindow(g.target) && !IsZoomed(g.target) && !IsIconic(g.target)) {
         RECT w;
         GetWindowRect(g.target, &w);
         if (w.left == g.adjWinPos.x && w.top == g.adjWinPos.y) {
@@ -1146,6 +1207,8 @@ void StopSession(bool restorePos) {
     g.reinjectPending = false;
     g.inMoveSize = false;
     g.posAdjusted = false;
+    g.pseudoMax = false;
+    g.pmMonitor = nullptr;
     g.expectValid = false;
 }
 
@@ -1173,6 +1236,7 @@ void ApplyScale(double s, bool fromUser) {
     const double vx = wasMapped ? MapX(g.rfx) : 0;
     const double vy = wasMapped ? MapY(g.rfy) : 0;
     g.scale = s;
+    PseudoMaxResize();
     FitTarget(fromUser);
     if (!g.exe.empty()) WriteScale(L"Scale", g.exe.c_str(), g.scale);
     g.layoutSig.clear();
@@ -1268,7 +1332,8 @@ void ShowHelp() {
         L"・メニュー、ドロップダウン、ダイアログも一緒に拡大されます\n"
         L"・倍率はアプリ(exe)ごとに記憶されます\n"
         L"・はみ出す場合はウインドウを自動で移動し、解除時に元の位置へ戻します\n"
-        L"・最大化/最小化中は一時停止し、元に戻すと再開します\n\n"
+        L"・最大化中のウインドウは、拡大した状態で画面いっぱいに表示します(解除で最大化に戻ります)\n"
+        L"・最小化中は一時停止し、元に戻すと再開します\n\n"
         L"https://github.com/Imaha486/WinZoom";
     MessageBoxW(nullptr, text.c_str(), L"WinZoom", MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
 }
@@ -1366,6 +1431,10 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DISPLAYCHANGE:
     case WM_SETTINGCHANGE:
         if (g.active) {
+            if (g.pseudoMax) {
+                g.pmMonitor = MonitorFromWindow(g.target, MONITOR_DEFAULTTONEAREST);
+                PseudoMaxResize();
+            }
             g.layoutSig.clear();
             PostRefresh();
         }
